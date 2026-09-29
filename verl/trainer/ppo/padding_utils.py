@@ -69,6 +69,24 @@ def build_padding_routed_experts(source_routed_experts: Any, seq_len: int) -> to
     )
 
 
+def build_padding_teacher_output(source_value: Any, seq_len: int, fill_value: float) -> torch.Tensor | None:
+    """Build a teacher logprob/id tensor matching the source per-token shape.
+
+    Distillation stores one teacher row per sequence token. A synthetic padding sample
+    replaces ``prompts``/``responses`` with a short sequence, so it must also shorten its
+    teacher rows -- keeping the source sample's rows leaves ``teacher_logprobs`` longer
+    than ``prompts + responses`` and trips the length check in ``no_padding_2_padding``.
+    """
+    if not isinstance(source_value, torch.Tensor):
+        return None
+    return torch.full(
+        (seq_len, *source_value.shape[1:]),
+        fill_value,
+        dtype=source_value.dtype,
+        device=source_value.device,
+    )
+
+
 def construct_minimal_padding_template(
     source_td: dict,
     source_tag: dict,
@@ -115,6 +133,18 @@ def construct_minimal_padding_template(
         rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
         rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
     )
+    # The contents do not matter -- response_mask is all-zero here so the distillation loss
+    # masks these rows out -- but teacher_ids must stay a valid vocab index because the topk
+    # losses gather student logprobs with it.
+    for teacher_key, fill_value in (("teacher_logprobs", 0.0), ("teacher_ids", float(eos_token_id))):
+        if teacher_key not in template_sample:
+            continue
+        teacher_value = build_padding_teacher_output(template_sample[teacher_key], input_ids.size(0), fill_value)
+        if teacher_value is None:
+            template_sample.pop(teacher_key, None)
+        else:
+            template_sample[teacher_key] = teacher_value
+
     if "multi_modal_inputs" in template_sample:
         template_sample["multi_modal_inputs"] = {}
     if routed_experts is not None:
